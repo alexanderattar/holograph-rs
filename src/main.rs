@@ -1,8 +1,13 @@
+mod contracts;
+
+use contracts::{get_abis, ContractAbis};
+
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use ethers::abi::Abi;
+use ethers::contract::Contract;
 use ethers::prelude::*;
 use ethers::types::Address;
 
@@ -110,9 +115,6 @@ struct NetworkMonitor {
     providers: HashMap<String, Arc<Provider<Http>>>,
 }
 
-const HOLOGRAPHER_ABI: &str = include_str!("../abis/Holographer.json");
-const HOLOGRAPH_ABI: &str = include_str!("../abis/Holograph.json");
-
 impl NetworkMonitor {
     fn new() -> Self {
         NetworkMonitor {
@@ -149,12 +151,14 @@ impl NetworkMonitor {
             Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "Provider not found"))
         })?;
 
-        // Deserialize ABI
-        let holographer_abi: Abi = serde_json::from_str(HOLOGRAPHER_ABI)?;
-        let holograph_abi: Abi = serde_json::from_str(HOLOGRAPH_ABI)?;
-
         // Parse HOLOGRAPH_ENV from environment variable
         let env_str = std::env::var("HOLOGRAPH_ENV").unwrap_or_else(|_| "develop".to_string());
+        let abis = get_abis(&env_str);
+
+        let holographer_abi: Abi = serde_json::from_str(abis.holographer_abi)?;
+        let holograph_abi: Abi = serde_json::from_str(abis.holograph_abi)?;
+        let holograph_operator_abi: Abi = serde_json::from_str(abis.holograph_operator_abi)?;
+
         let holograph_env = match env_str.as_str() {
             "localhost" => Environment::Localhost,
             "experimental" => Environment::Experimental,
@@ -192,6 +196,13 @@ impl NetworkMonitor {
         let registry_address = holograph.method::<(), Address>("getRegistry", ())?.call().await?;
         let token_address = holograph.method::<(), Address>("getUtilityToken", ())?.call().await?;
 
+        // Fetch the operator address and initialize the operator contract
+        let operator_address = holograph.method::<(), Address>("getOperator", ())?.call().await?;
+        let operator_contract =
+            Contract::new(operator_address, holograph_operator_abi, provider_arc.clone());
+        let messaging_module_address =
+            operator_contract.method::<(), Address>("getMessagingModule", ())?.call().await?;
+
         // Print addresses
         let addresses = vec![
             ("Holograph", holograph_address),
@@ -200,6 +211,8 @@ impl NetworkMonitor {
             ("Interfaces", &interfaces_address),
             ("Registry", &registry_address),
             ("HLG Token", &token_address),
+            ("Operator", &operator_address),
+            ("Messaging Module", &messaging_module_address),
         ];
 
         println!();
