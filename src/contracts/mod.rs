@@ -1,3 +1,8 @@
+use crate::environment::Environment;
+use ethers::types::Address;
+use std::collections::HashMap;
+use std::str::FromStr;
+
 pub struct ContractAbis {
     pub cxip_erc721_abi: &'static str,
     pub faucet_abi: &'static str,
@@ -67,4 +72,29 @@ pub fn get_abis(environment: &str) -> ContractAbis {
         editions_metadata_renderer_abi: abi_path(environment, "EditionsMetadataRenderer"),
         owner_abi: abi_path(environment, "Owner"),
     }
+}
+
+pub fn holograph_addresses() -> HashMap<Environment, Address> {
+    let mut m = HashMap::new();
+    m.insert(
+        Environment::Localhost,
+        Address::from_str("0xa3931469C1D058a98dde3b5AEc4dA002B6ca7446").expect("Invalid address"),
+    );
+    m.insert(
+        Environment::Experimental,
+        Address::from_str("0x199728d88a68856868f50FC259F01Bb4D2672Da9").expect("Invalid address"),
+    );
+    m.insert(
+        Environment::Develop,
+        Address::from_str("0x8dd0A4D129f03F1251574E545ad258dE26cD5e97").expect("Invalid address"),
+    );
+    m.insert(
+        Environment::Testnet,
+        Address::from_str("0x6429b42da2a06aA1C46710509fC96E846F46181e").expect("Invalid address"),
+    );
+    m.insert(
+        Environment::Mainnet,
+        Address::from_str("0x6429b42da2a06aA1C46710509fC96E846F46181e").expect("Invalid address"),
+    );
+    m
 }

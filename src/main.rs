@@ -1,6 +1,8 @@
 mod contracts;
+mod environment;
 
-use contracts::{get_abis, ContractAbis};
+use contracts::{get_abis, holograph_addresses, ContractAbis};
+use environment::Environment;
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -101,39 +103,21 @@ fn web_socket_error_codes() -> HashMap<i32, &'static str> {
     .collect()
 }
 
-#[derive(Hash, Eq, PartialEq, Debug, Clone)]
-enum Environment {
-    Localhost,
-    Experimental,
-    Develop,
-    Testnet,
-    Mainnet,
-}
-
 struct NetworkMonitor {
     networks: Vec<String>,
     providers: HashMap<String, Arc<Provider<Http>>>,
+    holograph_addresses: HashMap<Environment, Address>,
 }
 
 impl NetworkMonitor {
     fn new() -> Self {
+        let addresses = holograph_addresses();
+
         NetworkMonitor {
             networks: vec!["optimism".to_string()], // Initialize with optimism
             providers: HashMap::new(),
+            holograph_addresses: addresses,
         }
-    }
-
-    fn get_holograph_addresses() -> HashMap<Environment, Address> {
-        vec![
-            (Environment::Localhost, "0xa3931469C1D058a98dde3b5AEc4dA002B6ca7446"),
-            (Environment::Experimental, "0x199728d88a68856868f50FC259F01Bb4D2672Da9"),
-            (Environment::Develop, "0x8dd0A4D129f03F1251574E545ad258dE26cD5e97"),
-            (Environment::Testnet, "0x6429b42da2a06aA1C46710509fC96E846F46181e"),
-            (Environment::Mainnet, "0x6429b42da2a06aA1C46710509fC96E846F46181e"),
-        ]
-        .into_iter()
-        .map(|(env, addr_str)| (env, Address::from_str(addr_str).expect("Invalid address")))
-        .collect()
     }
 
     async fn init_providers(
@@ -176,7 +160,7 @@ impl NetworkMonitor {
         let holograph_abi: Abi = serde_json::from_str(abis.holograph_abi)?;
         let holograph_operator_abi: Abi = serde_json::from_str(abis.holograph_operator_abi)?;
 
-        let holograph_addresses = Self::get_holograph_addresses();
+        let holograph_addresses = &self.holograph_addresses;
         let holograph_address = holograph_addresses.get(env).ok_or_else(|| {
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
