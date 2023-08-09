@@ -43,7 +43,7 @@ fn abi_path(environment: &str, contract: &str) -> &'static str {
 
             _ => panic!("Unsupported contract"),
         },
-        // You can add other environments here
+        // Add other environments here
         _ => panic!("Unsupported environment"),
     }
 }

@@ -136,59 +136,60 @@ impl NetworkMonitor {
         .collect()
     }
 
-    async fn initialize_ethers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Get the provider URL from environment variables
-        let provider_url = std::env::var("PROVIDER_URL")?;
-
-        // Init providers
+    async fn init_providers(
+        &mut self,
+        provider_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         for network in &self.networks {
-            let provider = Provider::<Http>::connect(&provider_url).await;
+            let provider = Provider::<Http>::connect(provider_url).await;
             self.providers.insert(network.clone(), Arc::new(provider));
         }
+        Ok(())
+    }
 
-        // Fetch the provider for "optimism"
-        let provider_arc = self.providers.get(&"optimism".to_string()).ok_or_else(|| {
-            Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "Provider not found"))
-        })?;
-
-        // Parse HOLOGRAPH_ENV from environment variable
+    fn get_env() -> Result<Environment, Box<dyn std::error::Error>> {
         let env_str = std::env::var("HOLOGRAPH_ENV").unwrap_or_else(|_| "develop".to_string());
-        let abis = get_abis(&env_str);
+        match env_str.as_str() {
+            "localhost" => Ok(Environment::Localhost),
+            "experimental" => Ok(Environment::Experimental),
+            "develop" => Ok(Environment::Develop),
+            "testnet" => Ok(Environment::Testnet),
+            "mainnet" => Ok(Environment::Mainnet),
+            _ => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Unsupported HOLOGRAPH_ENV value",
+            ))),
+        }
+    }
 
+    async fn init_contracts(
+        &self,
+        env: &Environment,
+        abis: &ContractAbis,
+        provider_arc: &Arc<Provider<Http>>,
+    ) -> Result<
+        (Address, Address, Address, Address, Address, Address, Address, Address),
+        Box<dyn std::error::Error>,
+    > {
+        // Initialize main contracts
         let holographer_abi: Abi = serde_json::from_str(abis.holographer_abi)?;
         let holograph_abi: Abi = serde_json::from_str(abis.holograph_abi)?;
         let holograph_operator_abi: Abi = serde_json::from_str(abis.holograph_operator_abi)?;
 
-        let holograph_env = match env_str.as_str() {
-            "localhost" => Environment::Localhost,
-            "experimental" => Environment::Experimental,
-            "develop" => Environment::Develop,
-            "testnet" => Environment::Testnet,
-            "mainnet" => Environment::Mainnet,
-            _ => {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Unsupported HOLOGRAPH_ENV value",
-                )))
-            }
-        };
-
-        // Get holograph address
         let holograph_addresses = Self::get_holograph_addresses();
-        let holograph_address = holograph_addresses.get(&holograph_env).ok_or_else(|| {
+        let holograph_address = holograph_addresses.get(env).ok_or_else(|| {
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Holograph address not found",
             ))
         })?;
 
-        // Initialize contracts
         let holographer: ContractInstance<Arc<Provider<Http>>, _> =
             Contract::new(Address::zero(), holographer_abi.clone(), provider_arc.clone());
         let holograph =
             Contract::new(holograph_address.clone(), holograph_abi.clone(), provider_arc.clone());
 
-        // Fetch contract details
+        // Fetch contract addresses from the holograph contract
         let bridge_address = holograph.method::<(), Address>("getBridge", ())?.call().await?;
         let factory_address = holograph.method::<(), Address>("getFactory", ())?.call().await?;
         let interfaces_address =
@@ -203,16 +204,59 @@ impl NetworkMonitor {
         let messaging_module_address =
             operator_contract.method::<(), Address>("getMessagingModule", ())?.call().await?;
 
+        Ok((
+            *holograph_address,
+            bridge_address,
+            factory_address,
+            interfaces_address,
+            registry_address,
+            token_address,
+            operator_address,
+            messaging_module_address,
+        ))
+    }
+
+    async fn initialize_ethers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Get the provider URL from environment variables
+        let provider_url = std::env::var("PROVIDER_URL")?;
+
+        // Initialize providers
+        self.init_providers(&provider_url).await?;
+
+        // Fetch the provider for "optimism"
+        let provider_arc = self.providers.get(&"optimism".to_string()).ok_or_else(|| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "Provider not found"))
+        })?;
+
+        // Get the environment
+        let holograph_env = Self::get_env()?;
+
+        // Get contract abis
+        let env_str = std::env::var("HOLOGRAPH_ENV").unwrap_or_else(|_| "develop".to_string());
+        let abis = get_abis(&env_str);
+
+        // Initialize contracts and fetch addresses
+        let (
+            holograph_address,
+            bridge_address,
+            factory_address,
+            interfaces_address,
+            registry_address,
+            token_address,
+            operator_address,
+            messaging_module_address,
+        ) = self.init_contracts(&holograph_env, &abis, &provider_arc).await?;
+
         // Print addresses
         let addresses = vec![
             ("Holograph", holograph_address),
-            ("Bridge", &bridge_address),
-            ("Factory", &factory_address),
-            ("Interfaces", &interfaces_address),
-            ("Registry", &registry_address),
-            ("HLG Token", &token_address),
-            ("Operator", &operator_address),
-            ("Messaging Module", &messaging_module_address),
+            ("Bridge", bridge_address),
+            ("Factory", factory_address),
+            ("Interfaces", interfaces_address),
+            ("Registry", registry_address),
+            ("HLG Token", token_address),
+            ("Operator", operator_address),
+            ("Messaging Module", messaging_module_address),
         ];
 
         println!();
