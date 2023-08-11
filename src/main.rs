@@ -107,6 +107,7 @@ struct NetworkMonitor {
     networks: Vec<String>,
     providers: HashMap<String, Arc<Provider<Http>>>,
     holograph_addresses: HashMap<Environment, Address>,
+    contracts: HashMap<String, ContractInstance<Arc<Provider<Http>>, Provider<Http>>>,
 }
 
 impl NetworkMonitor {
@@ -117,6 +118,7 @@ impl NetworkMonitor {
             networks: vec!["optimism".to_string()], // Initialize with optimism
             providers: HashMap::new(),
             holograph_addresses: addresses,
+            contracts: HashMap::new(),
         }
     }
 
@@ -146,58 +148,70 @@ impl NetworkMonitor {
         }
     }
 
-    async fn init_contracts(
+    async fn fetch_address_from_holograph(
         &self,
+        name: &str,
+    ) -> Result<Address, Box<dyn std::error::Error>> {
+        match self.contracts.get("holograph") {
+            Some(contract) => {
+                let call = contract.method::<(), Address>(name, ())?;
+                call.call().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+            }
+            None => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Holograph contract not found",
+            ))),
+        }
+    }
+
+    async fn create_contract(
+        &self,
+        abi_str: &str,
+        address: Address,
+        provider: Arc<Provider<Http>>,
+    ) -> Result<Contract<Provider<Http>>, Box<dyn std::error::Error>> {
+        let abi: Abi = serde_json::from_str(abi_str)?;
+        Ok(Contract::new(address, abi, provider))
+    }
+
+    async fn init_contracts(
+        &mut self,
         env: &Environment,
         abis: &ContractAbis,
         provider_arc: &Arc<Provider<Http>>,
-    ) -> Result<
-        (Address, Address, Address, Address, Address, Address, Address, Address),
-        Box<dyn std::error::Error>,
-    > {
-        // Initialize main contracts
-        let holographer_abi: Abi = serde_json::from_str(abis.holographer_abi)?;
-        let holograph_abi: Abi = serde_json::from_str(abis.holograph_abi)?;
-        let holograph_operator_abi: Abi = serde_json::from_str(abis.holograph_operator_abi)?;
-
-        let holograph_addresses = &self.holograph_addresses;
-        let holograph_address = holograph_addresses.get(env).ok_or_else(|| {
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Get and store the holograph contract
+        let holograph_address = self.holograph_addresses.get(env).ok_or_else(|| {
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Holograph address not found",
             ))
         })?;
+        let holograph = self
+            .create_contract(abis.holograph_abi, holograph_address.clone(), provider_arc.clone())
+            .await?;
+        self.contracts.insert("holograph".to_string(), holograph);
 
-        let holographer: ContractInstance<Arc<Provider<Http>>, _> =
-            Contract::new(Address::zero(), holographer_abi.clone(), provider_arc.clone());
-        let holograph =
-            Contract::new(holograph_address.clone(), holograph_abi.clone(), provider_arc.clone());
+        // Information for contracts we want to create and store
+        let contracts_info = vec![
+            ("getBridge", "bridge", &abis.holograph_bridge_abi),
+            ("getFactory", "factory", &abis.holograph_factory_abi),
+            ("getInterfaces", "interfaces", &abis.holograph_interfaces_abi),
+            ("getRegistry", "registry", &abis.holograph_registry_abi),
+            ("getOperator", "operator", &abis.holograph_operator_abi),
+            // Uncomment below to add the token contract in the future
+            // ("getUtilityToken", "token", &abis.holograph_token_abi),
+        ];
 
-        // Fetch contract addresses from the holograph contract
-        let bridge_address = holograph.method::<(), Address>("getBridge", ())?.call().await?;
-        let factory_address = holograph.method::<(), Address>("getFactory", ())?.call().await?;
-        let interfaces_address =
-            holograph.method::<(), Address>("getInterfaces", ())?.call().await?;
-        let registry_address = holograph.method::<(), Address>("getRegistry", ())?.call().await?;
-        let token_address = holograph.method::<(), Address>("getUtilityToken", ())?.call().await?;
+        // Loop through contract info and fetch, create, and store each one
+        for (method_name, contract_name, abi_str) in contracts_info {
+            let address = self.fetch_address_from_holograph(method_name).await?;
+            let abi: Abi = serde_json::from_str(abi_str)?;
+            let contract = Contract::new(address, abi, provider_arc.clone());
+            self.contracts.insert(contract_name.to_string(), contract);
+        }
 
-        // Fetch the operator address and initialize the operator contract
-        let operator_address = holograph.method::<(), Address>("getOperator", ())?.call().await?;
-        let operator_contract =
-            Contract::new(operator_address, holograph_operator_abi, provider_arc.clone());
-        let messaging_module_address =
-            operator_contract.method::<(), Address>("getMessagingModule", ())?.call().await?;
-
-        Ok((
-            *holograph_address,
-            bridge_address,
-            factory_address,
-            interfaces_address,
-            registry_address,
-            token_address,
-            operator_address,
-            messaging_module_address,
-        ))
+        Ok(())
     }
 
     async fn initialize_ethers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -208,47 +222,48 @@ impl NetworkMonitor {
         self.init_providers(&provider_url).await?;
 
         // Fetch the provider for "optimism"
-        let provider_arc = self.providers.get(&"optimism".to_string()).ok_or_else(|| {
-            Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "Provider not found"))
-        })?;
+        let provider_arc = self
+            .providers
+            .get(&"optimism".to_string())
+            .ok_or_else(|| {
+                Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "Provider not found"))
+            })
+            .map(|arc| arc.clone())?;
 
-        // Get the environment
+        // Get the environment and contract abis
         let holograph_env = Self::get_env()?;
-
-        // Get contract abis
         let env_str = std::env::var("HOLOGRAPH_ENV").unwrap_or_else(|_| "develop".to_string());
         let abis = get_abis(&env_str);
 
-        // Initialize contracts and fetch addresses
-        let (
-            holograph_address,
-            bridge_address,
-            factory_address,
-            interfaces_address,
-            registry_address,
-            token_address,
-            operator_address,
-            messaging_module_address,
-        ) = self.init_contracts(&holograph_env, &abis, &provider_arc).await?;
+        // Initialize contracts
+        self.init_contracts(&holograph_env, &abis, &provider_arc).await?;
 
-        // Print addresses
-        let addresses = vec![
-            ("Holograph", holograph_address),
-            ("Bridge", bridge_address),
-            ("Factory", factory_address),
-            ("Interfaces", interfaces_address),
-            ("Registry", registry_address),
-            ("HLG Token", token_address),
-            ("Operator", operator_address),
-            ("Messaging Module", messaging_module_address),
+        // Print addresses directly from the contracts HashMap
+        let contract_names = vec![
+            "holograph",
+            "bridge",
+            "factory",
+            "interfaces",
+            "registry",
+            "operator",
+            // Add other contracts here
         ];
 
         println!();
-        for (name, address) in addresses {
-            println!("📄 {}: {:?}", name, address);
+        for name in contract_names {
+            if let Some(contract) = self.contracts.get(name) {
+                println!("📄 {}: {:?}", name, contract.address());
+            }
         }
-        println!();
 
+        // Get and print the messaging module address
+        if let Some(operator_contract) = self.contracts.get("operator") {
+            let messaging_module_address: Address =
+                operator_contract.method("getMessagingModule", ())?.call().await?;
+            println!("📄 Messaging Module: {:?}", messaging_module_address);
+        }
+
+        println!();
         Ok(())
     }
 }
