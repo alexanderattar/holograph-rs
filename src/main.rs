@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use chrono::Utc;
+use colored::*;
 use ethers::abi::Abi;
 use ethers::contract::Contract;
 use ethers::prelude::*;
@@ -249,10 +251,14 @@ impl NetworkMonitor {
             // Add other contracts here
         ];
 
-        println!();
         for name in contract_names {
             if let Some(contract) = self.contracts.get(name) {
-                println!("📄 {}: {:?}", name, contract.address());
+                let capitalized_name =
+                    name.chars().nth(0).unwrap_or_default().to_uppercase().to_string() + &name[1..]; // Capitalize the contract name here
+                self.structured_log(
+                    &format!("📄 {}: {:?}", capitalized_name, contract.address()),
+                    None,
+                );
             }
         }
 
@@ -260,11 +266,46 @@ impl NetworkMonitor {
         if let Some(operator_contract) = self.contracts.get("operator") {
             let messaging_module_address: Address =
                 operator_contract.method("getMessagingModule", ())?.call().await?;
-            println!("📄 Messaging Module: {:?}", messaging_module_address);
+            self.structured_log(
+                &format!("📄 Messaging Module: {:?}", messaging_module_address),
+                None,
+            );
         }
 
-        println!();
         Ok(())
+    }
+
+    fn structured_log(&self, msg: &str, tag_id: Option<&dyn ToString>) {
+        let timestamp = chrono::Utc::now().format("%+").to_string();
+        let timestamp_color = "green";
+
+        // Inferring the network from the providers.
+        // For simplicity, we're using the first network as an example.
+        let binding = "unknown".to_string();
+        let network = self.providers.keys().next().unwrap_or(&binding);
+        let network_name =
+            network.chars().nth(0).unwrap_or_default().to_uppercase().to_string() + &network[1..];
+
+        let env_name = match Self::get_env() {
+            Ok(env) => format!("{:?}", env),
+            Err(_) => "UnknownEnv".to_string(),
+        };
+
+        let tag_string = match tag_id {
+            Some(tag) => format!("[{}] ", tag.to_string()), // Added space after the closing bracket
+            None => "".to_string(),
+        };
+
+        let log_message = format!(
+            "[{}] [{}] [{}] {}{}",
+            timestamp.color(timestamp_color),
+            network_name.color("blue"),
+            env_name.color("cyan"),
+            tag_string,
+            msg.trim_start() // Remove leading whitespaces from the message
+        );
+
+        println!("{}", log_message);
     }
 }
 
@@ -274,7 +315,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut monitor = NetworkMonitor::new();
     if let Err(e) = monitor.initialize_ethers().await {
-        println!("Error initializing Ethers: {:?}", e);
+        monitor.structured_log(&format!("Error initializing Ethers: {:?}", e), None);
         return Err(e.into());
     }
 
@@ -284,7 +325,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let provider = match monitor.providers.get("optimism") {
         Some(p) => p,
         None => {
-            println!("Couldn't find the provider for the network.");
+            monitor.structured_log("Couldn't find the provider for the network.", None);
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Provider not found",
@@ -294,21 +335,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Retrieve and Print the Current Block Number
     match provider.get_block_number().await {
-        Ok(block_number) => println!("Current block number: {:?}", block_number),
-        Err(e) => println!("Error fetching block number: {:?}", e),
+        Ok(block_number) => {
+            monitor.structured_log(&format!("Current block number: {:?}", block_number), None);
+        }
+        Err(e) => {
+            monitor.structured_log(&format!("Error fetching block number: {:?}", e), None);
+        }
     }
 
     // Fetch a balance
     let address = Address::from_str(&test_address).expect("invalid address");
     match provider.get_balance(address, None).await {
-        Ok(balance) => println!("Balance of address {:?}: {:?}", address, balance),
-        Err(e) => println!("Error fetching balance for address {:?}: {:?}", address, e),
+        Ok(balance) => {
+            monitor.structured_log(
+                &format!("Balance of address {:?}: {:?}", address, balance),
+                Some(&address),
+            );
+        }
+        Err(e) => {
+            monitor.structured_log(
+                &format!("Error fetching balance for address {:?}: {:?}", address, e),
+                Some(&address),
+            );
+        }
     }
 
     // Fetch and Print Transaction Count
     match provider.get_transaction_count(address, None).await {
-        Ok(count) => println!("Transaction count for address {:?}: {:?}", address, count),
-        Err(e) => println!("Error fetching transaction count for address {:?}: {:?}", address, e),
+        Ok(count) => {
+            monitor.structured_log(
+                &format!("Transaction count for address {:?}: {:?}", address, count),
+                Some(&address),
+            );
+        }
+        Err(e) => {
+            monitor.structured_log(
+                &format!("Error fetching transaction count for address {:?}: {:?}", address, e),
+                Some(&address),
+            );
+        }
     }
 
     Ok(())
