@@ -21,6 +21,12 @@ use ethers::types::{Address, U64};
 use dotenv::dotenv;
 use serde_json;
 
+const TIMEOUT_THRESHOLD: u16 = 60_000;
+const ZERO: u8 = 0;
+const ONE: u8 = 1;
+const TWO: u8 = 2;
+const TEN: u8 = 10;
+
 enum OperatorMode {
     Listen,
     Manual,
@@ -82,35 +88,6 @@ enum ContractType {
     ERC20,
     ERC721,
     ERC1155,
-}
-
-const TIMEOUT_THRESHOLD: u64 = 60_000;
-const ZERO: i64 = 0;
-const ONE: i64 = 1;
-const TWO: i64 = 2;
-const TEN: i64 = 10;
-
-fn web_socket_error_codes() -> HashMap<i32, &'static str> {
-    vec![
-        (1000, "Normal Closure"),
-        (1001, "Going Away"),
-        (1002, "Protocol Error"),
-        (1003, "Unsupported Data"),
-        (1004, "(For future)"),
-        (1005, "No Status Received"),
-        (1006, "Abnormal Closure"),
-        (1007, "Invalid frame payload data"),
-        (1008, "Policy Violation"),
-        (1009, "Message too big"),
-        (1010, "Missing Extension"),
-        (1011, "Internal Error"),
-        (1012, "Service Restart"),
-        (1013, "Try Again Later"),
-        (1014, "Bad Gateway"),
-        (1015, "TLS Handshake"),
-    ]
-    .into_iter()
-    .collect()
 }
 
 struct BlockJob {
@@ -510,7 +487,7 @@ impl NetworkMonitor {
         let log_message = format!(
             "[{}] [{}] [{}] {}{}",
             timestamp.color(timestamp_color),
-            network_name.color("blue"),
+            network_name.color("red"),
             env_name.color("cyan"),
             tag_string,
             msg.trim_start() // Remove leading whitespaces from the message
@@ -546,6 +523,29 @@ impl NetworkMonitor {
 
         println!("{}", log_message);
     }
+}
+
+fn web_socket_error_codes() -> HashMap<i32, &'static str> {
+    vec![
+        (1000, "Normal Closure"),
+        (1001, "Going Away"),
+        (1002, "Protocol Error"),
+        (1003, "Unsupported Data"),
+        (1004, "(For future)"),
+        (1005, "No Status Received"),
+        (1006, "Abnormal Closure"),
+        (1007, "Invalid frame payload data"),
+        (1008, "Policy Violation"),
+        (1009, "Message too big"),
+        (1010, "Missing Extension"),
+        (1011, "Internal Error"),
+        (1012, "Service Restart"),
+        (1013, "Try Again Later"),
+        (1014, "Bad Gateway"),
+        (1015, "TLS Handshake"),
+    ]
+    .into_iter()
+    .collect()
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -584,11 +584,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Sleep indefinitely to keep the program running
-    loop {
-        // Sleep for an hour, but this loop will basically make it sleep forever
-        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+    // Handle the Ctrl+C signal
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    // This will run until a Ctrl+C signal is received.
+    tokio::select! {
+        _ = ctrl_c => {
+            println!("\nShutting down...");
+        }
+        _ = async {
+            // Sleep indefinitely to keep the program running
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+            }
+        } => {}
     }
+
+    Ok(())
 }
 
 #[tokio::main]
