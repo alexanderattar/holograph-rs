@@ -1,13 +1,15 @@
 mod contracts;
 mod environment;
+mod events;
 
 use contracts::{get_abis, holograph_addresses, ContractAbis};
 use environment::Environment;
+use events::{BloomFilter, BloomFilterMap, BloomType, EventType};
 
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 use colored::*;
@@ -15,6 +17,7 @@ use ethers::abi::Abi;
 use ethers::contract::Contract;
 use ethers::prelude::*;
 use ethers::types::Address;
+use ethers::types::U64;
 
 use dotenv::dotenv;
 use serde_json;
@@ -61,15 +64,14 @@ struct NetworkFlag {
     network: Option<String>,
 }
 
-struct BlockJob {
-    network: String,
-    block: i64, // Assuming block numbers are i64
-}
-
 struct TransactionFilter {
     filter_type: FilterType,
     match_field: MatchField,
     network_dependant: bool,
+}
+struct LogMessage {
+    msg: String,
+    tag_id: Option<String>,
 }
 
 enum MatchField {
@@ -77,33 +79,11 @@ enum MatchField {
     ComplexMatch(std::collections::HashMap<String, String>), // This replaces the {[key: string]: string} object structure
 }
 
-// TODO: Move types to their own files
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-enum EventType {
-    TransferERC20,
-    TransferERC721,
-    TransferSingleERC1155,
-    TransferBatchERC1155,
-    BridgeableContractDeployed,
-    HolographableContractEvent,
-    CrossChainMessageSent,
-    AvailableOperatorJob,
-    FinishedOperatorJob,
-    FailedOperatorJob,
-}
-
 enum ContractType {
     ERC20,
     ERC721,
     ERC1155,
 }
-
-enum BloomType {
-    Topic,
-}
-
-type BloomFilter = Vec<u8>; // Placeholder type. This should be replaced with the actual data type for a bloom filter in Rust.
-type BloomFilterMap = HashMap<EventType, BloomFilter>;
 
 const TIMEOUT_THRESHOLD: u64 = 60_000;
 const ZERO: i64 = 0;
@@ -134,11 +114,19 @@ fn web_socket_error_codes() -> HashMap<i32, &'static str> {
     .collect()
 }
 
+struct BlockJob {
+    network: String,
+    block: u64,
+}
+
 struct NetworkMonitor {
     networks: Vec<String>,
     providers: HashMap<String, Arc<Provider<Http>>>,
     holograph_addresses: HashMap<Environment, Address>,
     contracts: HashMap<String, ContractInstance<Arc<Provider<Http>>, Provider<Http>>>,
+    current_block_height: HashMap<String, u64>,
+    block_jobs: HashMap<String, Vec<BlockJob>>,
+
     bloom_filters: BloomFilterMap,
 }
 
@@ -151,6 +139,9 @@ impl NetworkMonitor {
             providers: HashMap::new(),
             holograph_addresses: addresses,
             contracts: HashMap::new(),
+            current_block_height: HashMap::new(),
+            block_jobs: HashMap::new(),
+
             bloom_filters: HashMap::new(),
         }
     }
@@ -306,6 +297,78 @@ impl NetworkMonitor {
         Ok(())
     }
 
+    async fn network_subscribe(&mut self, network: &str, tx: mpsc::Sender<LogMessage>) {
+        let network_string = network.to_string(); // Convert the network &str to a String
+
+        // Check if the network exists in the providers map.
+        if let Some(provider) = self.providers.get(&network_string) {
+            // Clone the Arc<Provider> to use in the async block.
+            let provider_clone = provider.clone();
+
+            tokio::spawn(async move {
+                let mut stream =
+                    provider_clone.watch_blocks().await.expect("Failed to watch blocks");
+                let mut last_block: Option<u64> = None;
+
+                let mut current_block_height: HashMap<String, u64> = HashMap::new();
+                let mut block_jobs: HashMap<String, Vec<BlockJob>> = HashMap::new();
+
+                while let Some(new_block_hash) = stream.next().await {
+                    let block = provider_clone
+                        .get_block(new_block_hash)
+                        .await
+                        .expect("Failed to get block details");
+
+                    let current_block_u64 = if let Some(actual_block) = block {
+                        actual_block.number.unwrap_or(U64::from(0)).as_u64()
+                    } else {
+                        0
+                    };
+
+                    // This check will prevent logging the same block number.
+                    if let Some(lb) = last_block {
+                        if lb == current_block_u64 {
+                            continue; // Skip if it's the same block as before
+                        }
+
+                        if lb + 1 < current_block_u64 {
+                            // Send structured log message through the channel
+                            let log_msg = format!(
+                            "Resuming previously dropped connection, gotta do some catching up. Block: {}", 
+                            current_block_u64
+                        );
+                            let _ = tx.send(LogMessage { msg: log_msg, tag_id: None }).await;
+
+                            // Handle the skipped blocks.
+                            for block in lb + 1..current_block_u64 {
+                                block_jobs
+                                    .entry(network_string.clone())
+                                    .or_insert_with(Vec::new)
+                                    .push(BlockJob { network: network_string.clone(), block });
+                            }
+                        }
+                    }
+                    last_block = Some(current_block_u64);
+
+                    // Update the current block height for the network.
+                    current_block_height.insert(network_string.clone(), current_block_u64);
+
+                    // Directly add the new block number to block_jobs
+                    block_jobs.entry(network_string.clone()).or_insert_with(Vec::new).push(
+                        BlockJob { network: network_string.clone(), block: current_block_u64 },
+                    );
+
+                    // Send another log message
+                    let log_msg = format!(
+                        "A new block has been mined. New block height is [{}]",
+                        current_block_u64
+                    );
+                    let _ = tx.send(LogMessage { msg: log_msg, tag_id: None }).await;
+                }
+            });
+        }
+    }
+
     fn build_filter(
         &self,
         bloom_type: BloomType,
@@ -326,7 +389,7 @@ impl NetworkMonitor {
                     .and_then(|name| self.contracts.get(name))
                     .map(|contract| contract.address().to_string());
 
-                self.build_filter(BloomType::Topic, event_type, address, contract_type)
+                self.build_filter(BloomType::TOPIC, event_type, address, contract_type)
             };
 
         // Build all filters first into a temporary vector
@@ -424,6 +487,39 @@ impl NetworkMonitor {
         )))
     }
 
+    fn structured_log(&self, msg: &str, tag_id: Option<&str>) {
+        let timestamp = chrono::Utc::now().format("%+").to_string();
+        let timestamp_color = "green";
+
+        // Inferring the network from the providers.
+        // For simplicity, this is just using the first provider in the providers map.
+        let binding = "unknown".to_string();
+        let network = self.providers.keys().next().unwrap_or(&binding);
+        let network_name =
+            network.chars().nth(0).unwrap_or_default().to_uppercase().to_string() + &network[1..];
+
+        let env_name = match Self::get_env() {
+            Ok(env) => format!("{:?}", env),
+            Err(_) => "UnknownEnv".to_string(),
+        };
+
+        let tag_string = match tag_id {
+            Some(tag) => format!("[{}] ", tag.to_string()), // Added space after the closing bracket
+            None => "".to_string(),
+        };
+
+        let log_message = format!(
+            "[{}] [{}] [{}] {}{}",
+            timestamp.color(timestamp_color),
+            network_name.color("blue"),
+            env_name.color("cyan"),
+            tag_string,
+            msg.trim_start() // Remove leading whitespaces from the message
+        );
+
+        println!("{}", log_message);
+    }
+
     fn structured_log_error(&self, network: &str, msg: &str) {
         let timestamp = chrono::Utc::now().format("%+").to_string();
         let timestamp_color = "red"; // Changed to red for error logging
@@ -451,39 +547,6 @@ impl NetworkMonitor {
 
         println!("{}", log_message);
     }
-
-    fn structured_log(&self, msg: &str, tag_id: Option<&dyn ToString>) {
-        let timestamp = chrono::Utc::now().format("%+").to_string();
-        let timestamp_color = "green";
-
-        // Inferring the network from the providers.
-        // For simplicity, we're using the first network as an example.
-        let binding = "unknown".to_string();
-        let network = self.providers.keys().next().unwrap_or(&binding);
-        let network_name =
-            network.chars().nth(0).unwrap_or_default().to_uppercase().to_string() + &network[1..];
-
-        let env_name = match Self::get_env() {
-            Ok(env) => format!("{:?}", env),
-            Err(_) => "UnknownEnv".to_string(),
-        };
-
-        let tag_string = match tag_id {
-            Some(tag) => format!("[{}] ", tag.to_string()), // Added space after the closing bracket
-            None => "".to_string(),
-        };
-
-        let log_message = format!(
-            "[{}] [{}] [{}] {}{}",
-            timestamp.color(timestamp_color),
-            network_name.color("blue"),
-            env_name.color("cyan"),
-            tag_string,
-            msg.trim_start() // Remove leading whitespaces from the message
-        );
-
-        println!("{}", log_message);
-    }
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -496,9 +559,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(e.into());
     }
 
-    // Start simple provider tests //
-
-    // Get the provider for the network
+    // Get the provider for the network from the monitor for other tasks to use
     let provider = match monitor.providers.get("optimism") {
         Some(p) => p,
         None => {
@@ -510,50 +571,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Retrieve and Print the Current Block Number
-    match provider.get_block_number().await {
-        Ok(block_number) => {
-            monitor.structured_log(&format!("Current block number: {:?}", block_number), None);
-        }
-        Err(e) => {
-            monitor.structured_log(&format!("Error fetching block number: {:?}", e), None);
-        }
-    }
+    // Create a channel for log messages
+    let (tx, mut rx) = mpsc::channel(32);
 
-    // Fetch a balance
-    let address = Address::from_str(&test_address).expect("invalid address");
-    match provider.get_balance(address, None).await {
-        Ok(balance) => {
-            monitor.structured_log(
-                &format!("Balance of address {:?}: {:?}", address, balance),
-                Some(&address),
-            );
-        }
-        Err(e) => {
-            monitor.structured_log(
-                &format!("Error fetching balance for address {:?}: {:?}", address, e),
-                Some(&address),
-            );
-        }
-    }
+    // Start block monitoring for "optimism" network and pass the tx part of the channel
+    monitor.network_subscribe("optimism", tx).await;
 
-    // Fetch and Print Transaction Count
-    match provider.get_transaction_count(address, None).await {
-        Ok(count) => {
-            monitor.structured_log(
-                &format!("Transaction count for address {:?}: {:?}", address, count),
-                Some(&address),
-            );
+    // Dedicated task for handling log messages
+    tokio::spawn(async move {
+        while let Some(log_msg) = rx.recv().await {
+            // Print structured log here
+            monitor.structured_log(&log_msg.msg, log_msg.tag_id.as_deref());
         }
-        Err(e) => {
-            monitor.structured_log(
-                &format!("Error fetching transaction count for address {:?}: {:?}", address, e),
-                Some(&address),
-            );
-        }
-    }
+    });
 
-    Ok(())
+    // Sleep indefinitely to keep the program running
+    loop {
+        // Sleep for an hour, but this loop will basically make it sleep forever
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+    }
 }
 
 #[tokio::main]
