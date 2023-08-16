@@ -7,7 +7,7 @@ use environment::Environment;
 use events::{BloomFilter, BloomFilterMap, BloomType, EventType};
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -16,8 +16,7 @@ use colored::*;
 use ethers::abi::Abi;
 use ethers::contract::Contract;
 use ethers::prelude::*;
-use ethers::types::Address;
-use ethers::types::U64;
+use ethers::types::{Address, U64};
 
 use dotenv::dotenv;
 use serde_json;
@@ -124,8 +123,8 @@ struct NetworkMonitor {
     providers: HashMap<String, Arc<Provider<Http>>>,
     holograph_addresses: HashMap<Environment, Address>,
     contracts: HashMap<String, ContractInstance<Arc<Provider<Http>>, Provider<Http>>>,
-    current_block_height: HashMap<String, u64>,
-    block_jobs: HashMap<String, Vec<BlockJob>>,
+    current_block_height: Arc<Mutex<HashMap<String, u64>>>,
+    block_jobs: Arc<Mutex<HashMap<String, Vec<BlockJob>>>>,
 
     bloom_filters: BloomFilterMap,
 }
@@ -139,8 +138,8 @@ impl NetworkMonitor {
             providers: HashMap::new(),
             holograph_addresses: addresses,
             contracts: HashMap::new(),
-            current_block_height: HashMap::new(),
-            block_jobs: HashMap::new(),
+            current_block_height: Arc::new(Mutex::new(HashMap::new())),
+            block_jobs: Arc::new(Mutex::new(HashMap::new())),
 
             bloom_filters: HashMap::new(),
         }
@@ -298,20 +297,19 @@ impl NetworkMonitor {
     }
 
     async fn network_subscribe(&mut self, network: &str, tx: mpsc::Sender<LogMessage>) {
-        let network_string = network.to_string(); // Convert the network &str to a String
+        let network_string = network.to_string();
 
-        // Check if the network exists in the providers map.
         if let Some(provider) = self.providers.get(&network_string) {
-            // Clone the Arc<Provider> to use in the async block.
             let provider_clone = provider.clone();
+
+            // Clone the Arcs for use inside the async block
+            let current_block_height = self.current_block_height.clone();
+            let block_jobs = self.block_jobs.clone();
 
             tokio::spawn(async move {
                 let mut stream =
                     provider_clone.watch_blocks().await.expect("Failed to watch blocks");
                 let mut last_block: Option<u64> = None;
-
-                let mut current_block_height: HashMap<String, u64> = HashMap::new();
-                let mut block_jobs: HashMap<String, Vec<BlockJob>> = HashMap::new();
 
                 while let Some(new_block_hash) = stream.next().await {
                     let block = provider_clone
@@ -325,24 +323,21 @@ impl NetworkMonitor {
                         0
                     };
 
-                    // This check will prevent logging the same block number.
                     if let Some(lb) = last_block {
                         if lb == current_block_u64 {
-                            continue; // Skip if it's the same block as before
+                            continue;
                         }
 
                         if lb + 1 < current_block_u64 {
-                            // Send structured log message through the channel
                             let log_msg = format!(
-                            "Resuming previously dropped connection, gotta do some catching up. Block: {}", 
-                            current_block_u64
-                        );
+                                "Resuming previously dropped connection, gotta do some catching up. Block: {}",
+                                current_block_u64
+                            );
                             let _ = tx.send(LogMessage { msg: log_msg, tag_id: None }).await;
 
-                            // Handle the skipped blocks.
                             for block in lb + 1..current_block_u64 {
-                                block_jobs
-                                    .entry(network_string.clone())
+                                let mut bj = block_jobs.lock().unwrap();
+                                bj.entry(network_string.clone())
                                     .or_insert_with(Vec::new)
                                     .push(BlockJob { network: network_string.clone(), block });
                             }
@@ -350,15 +345,19 @@ impl NetworkMonitor {
                     }
                     last_block = Some(current_block_u64);
 
-                    // Update the current block height for the network.
-                    current_block_height.insert(network_string.clone(), current_block_u64);
+                    {
+                        let mut cbh = current_block_height.lock().unwrap();
+                        cbh.insert(network_string.clone(), current_block_u64);
+                    }
 
-                    // Directly add the new block number to block_jobs
-                    block_jobs.entry(network_string.clone()).or_insert_with(Vec::new).push(
-                        BlockJob { network: network_string.clone(), block: current_block_u64 },
-                    );
+                    {
+                        let mut bj = block_jobs.lock().unwrap();
+                        bj.entry(network_string.clone()).or_insert_with(Vec::new).push(BlockJob {
+                            network: network_string.clone(),
+                            block: current_block_u64,
+                        });
+                    }
 
-                    // Send another log message
                     let log_msg = format!(
                         "A new block has been mined. New block height is [{}]",
                         current_block_u64
