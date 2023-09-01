@@ -281,7 +281,7 @@ impl NetworkMonitor {
         &mut self,
         network: &str,
         tx_logs: mpsc::Sender<LogMessage>,
-        tx_blocks: mpsc::Sender<Option<Block<TxHash>>>,
+        tx_blocks: mpsc::Sender<BlockJob>, // Change the type to BlockJob
     ) {
         // Convert the network argument to a String.
         let network_string = network.to_string();
@@ -291,9 +291,8 @@ impl NetworkMonitor {
             // Clone the provider to use inside the async block.
             let provider_clone = provider.clone();
 
-            // Clone the Arcs (reference-counted thread-safe smart pointers) to use inside the async block.
+            // Clone the Arc for the current block height to use inside the async block.
             let current_block_height = self.current_block_height.clone();
-            let block_jobs = self.block_jobs.clone();
 
             // Spawn a new asynchronous task.
             tokio::spawn(async move {
@@ -314,8 +313,6 @@ impl NetworkMonitor {
 
                     // Extract the block number from the block.
                     let current_block_u64 = if let Some(actual_block) = block_opt.clone() {
-                        // Send the block details to tx_blocks channel.
-                        let _ = tx_blocks.send(Some(actual_block.clone())).await;
                         actual_block.number.unwrap_or(U64::from(0)).as_u64()
                     } else {
                         // Handle or log cases where the block details couldn't be fetched.
@@ -333,16 +330,14 @@ impl NetworkMonitor {
                         // If the last block seen and the current block have a gap...
                         if lb + 1 < current_block_u64 {
                             // ...log a message about the connection drop.
-                            let log_msg = format!("Resuming previously dropped connection, gotta do some catching up. Block: {}", current_block_u64);
+                            let log_msg = format!(
+                                "Resuming previously dropped connection, gotta do some catching up. Block: {}",
+                                current_block_u64
+                            );
                             let _ = tx_logs.send(LogMessage { msg: log_msg, tag_id: None }).await;
 
-                            // Queue jobs for each missing block.
-                            for block in lb + 1..current_block_u64 {
-                                let mut bj = block_jobs.lock().await;
-                                bj.entry(network_string.clone())
-                                    .or_insert_with(Vec::new)
-                                    .push(BlockJob { network: network_string.clone(), block });
-                            }
+                            // TODO: We're not storing jobs in a Vec anymore, so we need to
+                            // think about how to handle missed blocks.
                         }
                     }
                     // Update the last block to the current block.
@@ -352,12 +347,10 @@ impl NetworkMonitor {
                     let mut cbh = current_block_height.lock().await;
                     cbh.insert(network_string.clone(), current_block_u64);
 
-                    // Add a job for the current block.
-                    let mut bj = block_jobs.lock().await;
-                    bj.entry(network_string.clone()).or_insert_with(Vec::new).push(BlockJob {
-                        network: network_string.clone(),
-                        block: current_block_u64,
-                    });
+                    // Instead of adding the job to a vector, send it directly to the channel.
+                    let block_job =
+                        BlockJob { network: network_string.clone(), block: current_block_u64 };
+                    let _ = tx_blocks.send(block_job).await;
 
                     // Log that a new block has been mined.
                     let log_msg = format!(
@@ -668,31 +661,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Dedicated task for handling block messages
-    let monitor_for_block_msg_task = monitor.clone();
-    tokio::spawn(async move {
-        while let Some(block_msg) = rx_blocks.recv().await {
-            // For now, this just prints the block message.
-            println!("{:?}", block_msg);
-        }
-    });
-
-    // Dedicated task for processing block jobs from the shared vector
-    let block_jobs_clone = monitor.lock().await.block_jobs.clone();
     let monitor_for_block_task = monitor.clone();
     tokio::spawn(async move {
-        loop {
-            {
-                let mut block_jobs_guard = block_jobs_clone.lock().await;
-                let jobs_for_network =
-                    block_jobs_guard.entry("optimism".to_string()).or_insert_with(Vec::new);
-
-                while let Some(block_job) = jobs_for_network.pop() {
-                    let monitor_guard = monitor_for_block_task.lock().await;
-                    monitor_guard.process_block(block_job).await;
-                }
-            }
-
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Wait for a few seconds before checking again
+        while let Some(block_job) = rx_blocks.recv().await {
+            // For now, this just processes the block job.
+            let monitor_guard = monitor_for_block_task.lock().await;
+            monitor_guard.process_block(block_job).await;
         }
     });
 
