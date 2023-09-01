@@ -1,15 +1,18 @@
 mod contracts;
 mod environment;
 mod events;
+mod types;
 
 use contracts::{get_abis, holograph_addresses, ContractAbis};
 use environment::Environment;
 use events::{BloomFilter, BloomFilterMap, BloomType, EventType};
+use types::InterestingTransaction;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use colored::*;
@@ -81,7 +84,7 @@ struct LogMessage {
 
 enum MatchField {
     SimpleMatch(String),
-    ComplexMatch(std::collections::HashMap<String, String>), // This replaces the {[key: string]: string} object structure
+    ComplexMatch(std::collections::HashMap<String, String>),
 }
 
 enum ContractType {
@@ -273,68 +276,85 @@ impl NetworkMonitor {
         Ok(())
     }
 
+    // Asynchronously subscribe to a specified network.
     async fn network_subscribe(&mut self, network: &str, tx: mpsc::Sender<LogMessage>) {
+        // Convert the network argument to a String.
         let network_string = network.to_string();
 
+        // Check if there's a provider for the given network.
         if let Some(provider) = self.providers.get(&network_string) {
+            // Clone the provider to use inside the async block.
             let provider_clone = provider.clone();
 
-            // Clone the Arcs for use inside the async block
+            // Clone the Arcs (reference-counted thread-safe smart pointers) to use inside the async block.
             let current_block_height = self.current_block_height.clone();
             let block_jobs = self.block_jobs.clone();
 
+            // Spawn a new asynchronous task.
             tokio::spawn(async move {
+                // Get an asynchronous stream of blocks from the provider.
                 let mut stream =
                     provider_clone.watch_blocks().await.expect("Failed to watch blocks");
+
+                // Initialize a mutable option for the last block number seen.
                 let mut last_block: Option<u64> = None;
 
+                // Continuously get the next block hash from the stream.
                 while let Some(new_block_hash) = stream.next().await {
+                    // Fetch block details using the block hash.
                     let block = provider_clone
                         .get_block(new_block_hash)
                         .await
                         .expect("Failed to get block details");
 
+                    // Extract the block number from the block, default to 0 if not present.
                     let current_block_u64 = if let Some(actual_block) = block {
                         actual_block.number.unwrap_or(U64::from(0)).as_u64()
                     } else {
                         0
                     };
 
+                    // If there's a previously seen block...
                     if let Some(lb) = last_block {
+                        // ...and it's the same as the current block, skip processing.
                         if lb == current_block_u64 {
                             continue;
                         }
 
+                        // If the last block seen and the current block have a gap...
                         if lb + 1 < current_block_u64 {
-                            let log_msg = format!(
-                                "Resuming previously dropped connection, gotta do some catching up. Block: {}",
-                                current_block_u64
-                            );
+                            // ...log a message about the connection drop.
+                            let log_msg = format!("Resuming previously dropped connection, gotta do some catching up. Block: {}", current_block_u64);
                             let _ = tx.send(LogMessage { msg: log_msg, tag_id: None }).await;
 
+                            // Queue jobs for each missing block.
                             for block in lb + 1..current_block_u64 {
-                                let mut bj = block_jobs.lock().unwrap();
+                                let mut bj = block_jobs.lock().await;
                                 bj.entry(network_string.clone())
                                     .or_insert_with(Vec::new)
                                     .push(BlockJob { network: network_string.clone(), block });
                             }
                         }
                     }
+                    // Update the last block to the current block.
                     last_block = Some(current_block_u64);
 
+                    // Update the current block height in a thread-safe manner.
                     {
-                        let mut cbh = current_block_height.lock().unwrap();
+                        let mut cbh = current_block_height.lock().await;
                         cbh.insert(network_string.clone(), current_block_u64);
                     }
 
+                    // Add a job for the current block.
                     {
-                        let mut bj = block_jobs.lock().unwrap();
+                        let mut bj = block_jobs.lock().await;
                         bj.entry(network_string.clone()).or_insert_with(Vec::new).push(BlockJob {
                             network: network_string.clone(),
                             block: current_block_u64,
                         });
                     }
 
+                    // Log that a new block has been mined.
                     let log_msg = format!(
                         "A new block has been mined. New block height is [{}]",
                         current_block_u64
@@ -343,6 +363,80 @@ impl NetworkMonitor {
                 }
             });
         }
+    }
+
+    async fn process_block(&self, job: BlockJob) {
+        let mut interesting_transactions: Vec<InterestingTransaction> = Vec::new();
+
+        // TODO: `self.activated` is a HashMap<String, bool> to track network activation status
+        // self.activated.insert(job.network.clone(), true);
+
+        // TODO: `self.structured_log_verbose` is a method to log the current block being processed
+        // self.structured_log_verbose(&job.network, "Getting block 🔍", job.block);
+
+        if let Some(provider) = self.providers.get(&job.network) {
+            let block_with_txs = provider.get_block_with_txs(U64::from(job.block)).await;
+
+            match block_with_txs {
+                Ok(Some(block)) => {
+                    // Printing basic information about the block
+                    println!("Block Number: {:?}", block.number);
+                    println!("Block Hash: {:?}", block.hash);
+                    println!("Parent Hash: {:?}", block.parent_hash);
+                    println!("Number of Transactions: {}", block.transactions.len());
+
+                    // Check if the block is recent
+                    let current_height = self
+                        .current_block_height
+                        .lock()
+                        .await
+                        .get(&job.network)
+                        .cloned()
+                        .unwrap_or_default();
+                    let is_recent_block = current_height.wrapping_sub(job.block) < 5;
+
+                    // TODO: function update_gas_pricing to update the gas prices based on the current block
+                    if is_recent_block {
+                        // self.gas_prices.insert(job.network.clone(), update_gas_pricing(&job.network, &block));
+                    }
+
+                    // Check bloom logs and fetch logs if present. TODO: implement check_bloom_logs
+                    // if self.check_bloom_logs(&block) {
+                    //     let logs = provider.get_logs(Filter {
+                    //         from_block: Some(job.block.into()),
+                    //         to_block: Some(job.block.into()),
+                    //         ..Default::default()
+                    //     }).await;
+
+                    //     match logs {
+                    //         Ok(logs_list) => {
+                    //             // TODO: sort and filter the logs and process the transactions
+                    //             // self.filter_transactions2(&job, &block.transactions, &logs_list, &mut interesting_transactions);
+                    //         }
+                    //         Err(e) => {
+                    //             // Handle error while fetching logs
+                    //         }
+                    //     }
+                    // }
+
+                    // If there are interesting transactions, process them
+                    if !interesting_transactions.is_empty() {
+                        // self.process_transactions2(&job, &interesting_transactions).await;
+                    }
+                }
+                Ok(None) => {
+                    // This case means the provider returned a successful result, but no block was found.
+                    println!("No block was returned for block number {}", job.block);
+                }
+                Err(e) => {
+                    // Handle error fetching block with transactions
+                    // self.structured_log_error(&job.network, &format!("Error processing block {}", e), job.block);
+                }
+            }
+        }
+
+        // TODO: a block job handler to handle jobs after processing blocks
+        // self.block_job_handler(&job).await;
     }
 
     fn build_filter(
@@ -552,35 +646,60 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok(); // Load environment variables from .env file
     let test_address = std::env::var("TEST_ADDRESS").expect("TEST_ADDRESS not set in environment");
 
-    let mut monitor = NetworkMonitor::new();
-    if let Err(e) = monitor.initialize_ethers().await {
-        monitor.structured_log(&format!("Error initializing Ethers: {:?}", e), None);
-        return Err(e.into());
-    }
-
-    // Get the provider for the network from the monitor for other tasks to use
-    let provider = match monitor.providers.get("optimism") {
-        Some(p) => p,
-        None => {
-            monitor.structured_log("Couldn't find the provider for the network.", None);
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Provider not found",
-            )));
-        }
-    };
+    let monitor = Arc::new(Mutex::new(NetworkMonitor::new()));
 
     // Create a channel for log messages
     let (tx, mut rx) = mpsc::channel(32);
 
-    // Start block monitoring for "optimism" network and pass the tx part of the channel
-    monitor.network_subscribe("optimism", tx).await;
+    {
+        let mut monitor_guard = monitor.lock().await;
+        if let Err(e) = monitor_guard.initialize_ethers().await {
+            monitor_guard.structured_log(&format!("Error initializing Ethers: {:?}", e), None);
+            return Err(e.into());
+        }
+
+        // Get the provider for the network from the monitor for other tasks to use
+        let provider = match monitor_guard.providers.get("optimism") {
+            Some(p) => p,
+            None => {
+                monitor_guard.structured_log("Couldn't find the provider for the network.", None);
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Provider not found",
+                )));
+            }
+        };
+
+        // Start block monitoring for "optimism" network and pass the tx part of the channel
+        monitor_guard.network_subscribe("optimism", tx.clone()).await;
+    }
 
     // Dedicated task for handling log messages
+    let monitor_for_task = monitor.clone();
     tokio::spawn(async move {
         while let Some(log_msg) = rx.recv().await {
-            // Print structured log here
-            monitor.structured_log(&log_msg.msg, log_msg.tag_id.as_deref());
+            let monitor_guard = monitor_for_task.lock().await;
+            monitor_guard.structured_log(&log_msg.msg, log_msg.tag_id.as_deref());
+        }
+    });
+
+    // Dedicated task for processing block jobs from the shared vector
+    let block_jobs_clone = monitor.lock().await.block_jobs.clone();
+    let monitor_for_block_task = monitor.clone();
+    tokio::spawn(async move {
+        loop {
+            {
+                let mut block_jobs_guard = block_jobs_clone.lock().await;
+                let jobs_for_network =
+                    block_jobs_guard.entry("optimism".to_string()).or_insert_with(Vec::new);
+
+                while let Some(block_job) = jobs_for_network.pop() {
+                    let monitor_guard = monitor_for_block_task.lock().await;
+                    monitor_guard.process_block(block_job).await;
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Wait for a few seconds before checking again
         }
     });
 
