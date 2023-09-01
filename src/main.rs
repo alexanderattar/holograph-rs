@@ -277,7 +277,12 @@ impl NetworkMonitor {
     }
 
     // Asynchronously subscribe to a specified network.
-    async fn network_subscribe(&mut self, network: &str, tx: mpsc::Sender<LogMessage>) {
+    async fn network_subscribe(
+        &mut self,
+        network: &str,
+        tx_logs: mpsc::Sender<LogMessage>,
+        tx_blocks: mpsc::Sender<Option<Block<TxHash>>>,
+    ) {
         // Convert the network argument to a String.
         let network_string = network.to_string();
 
@@ -302,16 +307,20 @@ impl NetworkMonitor {
                 // Continuously get the next block hash from the stream.
                 while let Some(new_block_hash) = stream.next().await {
                     // Fetch block details using the block hash.
-                    let block = provider_clone
+                    let block_opt = provider_clone
                         .get_block(new_block_hash)
                         .await
                         .expect("Failed to get block details");
 
-                    // Extract the block number from the block, default to 0 if not present.
-                    let current_block_u64 = if let Some(actual_block) = block {
+                    // Extract the block number from the block.
+                    let current_block_u64 = if let Some(actual_block) = block_opt.clone() {
+                        // Send the block details to tx_blocks channel.
+                        let _ = tx_blocks.send(Some(actual_block.clone())).await;
                         actual_block.number.unwrap_or(U64::from(0)).as_u64()
                     } else {
-                        0
+                        // Handle or log cases where the block details couldn't be fetched.
+                        // For now, we simply continue to the next iteration.
+                        continue;
                     };
 
                     // If there's a previously seen block...
@@ -325,7 +334,7 @@ impl NetworkMonitor {
                         if lb + 1 < current_block_u64 {
                             // ...log a message about the connection drop.
                             let log_msg = format!("Resuming previously dropped connection, gotta do some catching up. Block: {}", current_block_u64);
-                            let _ = tx.send(LogMessage { msg: log_msg, tag_id: None }).await;
+                            let _ = tx_logs.send(LogMessage { msg: log_msg, tag_id: None }).await;
 
                             // Queue jobs for each missing block.
                             for block in lb + 1..current_block_u64 {
@@ -340,26 +349,22 @@ impl NetworkMonitor {
                     last_block = Some(current_block_u64);
 
                     // Update the current block height in a thread-safe manner.
-                    {
-                        let mut cbh = current_block_height.lock().await;
-                        cbh.insert(network_string.clone(), current_block_u64);
-                    }
+                    let mut cbh = current_block_height.lock().await;
+                    cbh.insert(network_string.clone(), current_block_u64);
 
                     // Add a job for the current block.
-                    {
-                        let mut bj = block_jobs.lock().await;
-                        bj.entry(network_string.clone()).or_insert_with(Vec::new).push(BlockJob {
-                            network: network_string.clone(),
-                            block: current_block_u64,
-                        });
-                    }
+                    let mut bj = block_jobs.lock().await;
+                    bj.entry(network_string.clone()).or_insert_with(Vec::new).push(BlockJob {
+                        network: network_string.clone(),
+                        block: current_block_u64,
+                    });
 
                     // Log that a new block has been mined.
                     let log_msg = format!(
                         "A new block has been mined. New block height is [{}]",
                         current_block_u64
                     );
-                    let _ = tx.send(LogMessage { msg: log_msg, tag_id: None }).await;
+                    let _ = tx_logs.send(LogMessage { msg: log_msg, tag_id: None }).await;
                 }
             });
         }
@@ -371,8 +376,8 @@ impl NetworkMonitor {
         // TODO: `self.activated` is a HashMap<String, bool> to track network activation status
         // self.activated.insert(job.network.clone(), true);
 
-        // TODO: `self.structured_log_verbose` is a method to log the current block being processed
-        // self.structured_log_verbose(&job.network, "Getting block 🔍", job.block);
+        // TODO: update this to use the new structured logging and send to the log channel
+        // self.structured_log(&job.network, "Getting block 🔍", job.block);
 
         if let Some(provider) = self.providers.get(&job.network) {
             let block_with_txs = provider.get_block_with_txs(U64::from(job.block)).await;
@@ -411,7 +416,7 @@ impl NetworkMonitor {
                     //     match logs {
                     //         Ok(logs_list) => {
                     //             // TODO: sort and filter the logs and process the transactions
-                    //             // self.filter_transactions2(&job, &block.transactions, &logs_list, &mut interesting_transactions);
+                    //             // self.filter_transactions(&job, &block.transactions, &logs_list, &mut interesting_transactions);
                     //         }
                     //         Err(e) => {
                     //             // Handle error while fetching logs
@@ -619,40 +624,19 @@ impl NetworkMonitor {
     }
 }
 
-fn web_socket_error_codes() -> HashMap<i32, &'static str> {
-    vec![
-        (1000, "Normal Closure"),
-        (1001, "Going Away"),
-        (1002, "Protocol Error"),
-        (1003, "Unsupported Data"),
-        (1004, "(For future)"),
-        (1005, "No Status Received"),
-        (1006, "Abnormal Closure"),
-        (1007, "Invalid frame payload data"),
-        (1008, "Policy Violation"),
-        (1009, "Message too big"),
-        (1010, "Missing Extension"),
-        (1011, "Internal Error"),
-        (1012, "Service Restart"),
-        (1013, "Try Again Later"),
-        (1014, "Bad Gateway"),
-        (1015, "TLS Handshake"),
-    ]
-    .into_iter()
-    .collect()
-}
-
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok(); // Load environment variables from .env file
     let test_address = std::env::var("TEST_ADDRESS").expect("TEST_ADDRESS not set in environment");
 
     let monitor = Arc::new(Mutex::new(NetworkMonitor::new()));
 
-    // Create a channel for log messages
-    let (tx, mut rx) = mpsc::channel(32);
+    // Create channels for log and block messages
+    let (tx_logs, mut rx_logs) = mpsc::channel(32);
+    let (tx_blocks, mut rx_blocks) = mpsc::channel(32);
 
     {
         let mut monitor_guard = monitor.lock().await;
+
         if let Err(e) = monitor_guard.initialize_ethers().await {
             monitor_guard.structured_log(&format!("Error initializing Ethers: {:?}", e), None);
             return Err(e.into());
@@ -670,16 +654,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // Start block monitoring for "optimism" network and pass the tx part of the channel
-        monitor_guard.network_subscribe("optimism", tx.clone()).await;
+        // Start block monitoring for "optimism" network and pass both channels
+        monitor_guard.network_subscribe("optimism", tx_logs.clone(), tx_blocks.clone()).await;
     }
 
     // Dedicated task for handling log messages
-    let monitor_for_task = monitor.clone();
+    let monitor_for_log_task = monitor.clone();
     tokio::spawn(async move {
-        while let Some(log_msg) = rx.recv().await {
-            let monitor_guard = monitor_for_task.lock().await;
+        while let Some(log_msg) = rx_logs.recv().await {
+            let monitor_guard = monitor_for_log_task.lock().await;
             monitor_guard.structured_log(&log_msg.msg, log_msg.tag_id.as_deref());
+        }
+    });
+
+    // Dedicated task for handling block messages
+    let monitor_for_block_msg_task = monitor.clone();
+    tokio::spawn(async move {
+        while let Some(block_msg) = rx_blocks.recv().await {
+            // For now, this just prints the block message.
+            println!("{:?}", block_msg);
         }
     });
 
@@ -727,4 +720,28 @@ async fn main() {
     if let Err(e) = run().await {
         println!("An error occurred: {:?}", e);
     }
+}
+
+// TODO: Move these to a separate file
+fn web_socket_error_codes() -> HashMap<i32, &'static str> {
+    vec![
+        (1000, "Normal Closure"),
+        (1001, "Going Away"),
+        (1002, "Protocol Error"),
+        (1003, "Unsupported Data"),
+        (1004, "(For future)"),
+        (1005, "No Status Received"),
+        (1006, "Abnormal Closure"),
+        (1007, "Invalid frame payload data"),
+        (1008, "Policy Violation"),
+        (1009, "Message too big"),
+        (1010, "Missing Extension"),
+        (1011, "Internal Error"),
+        (1012, "Service Restart"),
+        (1013, "Try Again Later"),
+        (1014, "Bad Gateway"),
+        (1015, "TLS Handshake"),
+    ]
+    .into_iter()
+    .collect()
 }
